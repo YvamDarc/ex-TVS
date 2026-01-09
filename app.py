@@ -1,888 +1,896 @@
-# app.py
-from __future__ import annotations
+import re
+from datetime import datetime
+from io import BytesIO
 
-import json
-import math
-from dataclasses import dataclass, asdict
-from datetime import date
-from typing import Dict, List, Optional, Tuple, Any
-
+import numpy as np
 import pandas as pd
 import streamlit as st
 
 
-# ==========================================================
-# CONFIG STREAMLIT
-# ==========================================================
-st.set_page_config(
-    page_title="Taxe véhicules de tourisme (ex-TVS) — 2026",
-    layout="wide",
+# ============================
+# FEC columns (format "classique")
+# ============================
+FEC_COLUMNS = [
+    "JournalCode", "JournalLib",
+    "EcritureNum", "EcritureDate",
+    "CompteNum", "CompteLib",
+    "CompAuxNum", "CompAuxLib",
+    "PieceRef", "PieceDate",
+    "EcritureLib",
+    "Debit", "Credit",
+    "EcritureLet", "DateLet",
+    "ValidDate",
+    "Montantdevise", "Idevise"
+]
+
+FACTURE_RE = re.compile(r"Facture numéro\s+(\d+)\s+émise le\s+(\d{2}/\d{2}/\d{4})", re.IGNORECASE)
+BORDEREAU_RE = re.compile(
+    r"Bordereau\s*N°\s*:\s*([A-Za-z0-9\-]+).*?Remis\s+le\s+(\d{2}/\d{2}/\d{4})",
+    re.IGNORECASE
 )
 
-# ==========================================================
-# BARÈMES 2026 (selon ton cadrage)
-# ==========================================================
-
-# CO2 WLTP 2026 : tranches (start_g, end_g_inclusive, rate_eur_per_g)
-WLTP_2026: List[Tuple[int, int, int]] = [
-    (0, 4, 0),
-    (5, 45, 1),
-    (46, 53, 2),
-    (54, 85, 3),
-    (86, 105, 4),
-    (106, 125, 10),
-    (126, 145, 50),
-    (146, 165, 60),
-    (166, 10**9, 65),
-]
-
-# CO2 NEDC 2026
-NEDC_2026: List[Tuple[int, int, int]] = [
-    (0, 3, 0),
-    (4, 37, 1),
-    (38, 44, 2),
-    (45, 70, 3),
-    (71, 87, 4),
-    (88, 103, 10),
-    (104, 120, 50),
-    (121, 136, 60),
-    (137, 10**9, 65),
-]
-
-# Barème Puissance Administrative 2026 : (start_cv, end_cv_inclusive, rate_eur_per_cv)
-PA_2026: List[Tuple[int, int, int]] = [
-    (1, 3, 2000),
-    (4, 6, 3000),
-    (7, 10, 4500),
-    (11, 15, 5250),
-    (16, 10**9, 6500),
-]
-
-# Polluants 2026 par groupe
-POLLUTANTS_2026: Dict[str, int] = {"E": 0, "1": 100, "P": 500}
-
-# Coeff IK (frais kilométriques)
-IK_COEFF_TABLE = [
-    (0, 15000, 0.00, "0–15 000 km => coeff 0 %"),
-    (15001, 25000, 0.25, "15 001–25 000 km => coeff 25 %"),
-    (25001, 35000, 0.50, "25 001–35 000 km => coeff 50 %"),
-    (35001, 45000, 0.75, "35 001–45 000 km => coeff 75 %"),
-    (45001, 10**9, 1.00, "> 45 000 km => coeff 100 %"),
-]
+MODE_NORMALIZE = {
+    "carte bancaire": "carte bancaire",
+    "cb": "carte bancaire",
+    "carte": "carte bancaire",
+    "cheque": "chèque",
+    "chèque": "chèque",
+    "especes": "espèces",
+    "espèces": "espèces",
+    "virement": "virement",
+    "tiers payant": "tiers-payant",
+    "tiers-payant": "tiers-payant",
+    "tierspayant": "tiers-payant",
+}
 
 
-# ==========================================================
-# OUTILS / HELPERS ROBUSTES
-# ==========================================================
-def safe_int(x: Any, default: int = 0) -> int:
+# ============================
+# Helpers
+# ============================
+def normalize_mode(x) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    s = str(x).strip().lower()
+    s = re.sub(r"\s+", " ", s).replace("\u00a0", " ")
+    s = s.replace("’", "-").replace("'", "-")
+    s = s.replace("tiers payant", "tiers-payant").replace("tierspayant", "tiers-payant")
+    return MODE_NORMALIZE.get(s, s)
+
+
+def parse_eur(val) -> float:
+    """Parse '156,85€', '13,00€', 13, 13.0."""
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        if pd.isna(val):
+            return 0.0
+        return float(val)
+
+    s = str(val).strip()
+    if s == "" or s.lower() == "nan":
+        return 0.0
+
+    s = s.replace("€", "").replace("\u00a0", " ").strip().replace(" ", "")
+    if "," in s and "." in s:
+        s = s.replace(".", "")
+    s = s.replace(",", ".")
+    s = re.sub(r"[^0-9\.\-]", "", s)
+
+    if s in ("", ".", "-", "-."):
+        return 0.0
     try:
-        if x is None:
-            return default
-        return int(x)
-    except Exception:
-        return default
+        return float(s)
+    except ValueError:
+        return 0.0
 
 
-def safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
+def parse_tva_rate(val) -> float:
+    """Parse '20,00%' -> 0.20 ; 20 -> 0.20 ; '0' -> 0.0"""
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        if pd.isna(val):
+            return 0.0
+        v = float(val)
+        return v / 100.0 if v > 1.0 else v
+
+    s = str(val).strip().lower().replace("\u00a0", " ")
+    s = s.replace("%", "").strip()
+    if s == "" or s == "nan":
+        return 0.0
+    s = s.replace(" ", "")
+    if "," in s and "." in s:
+        s = s.replace(".", "")
+    s = s.replace(",", ".")
+    s = re.sub(r"[^0-9\.\-]", "", s)
+
+    if s in ("", ".", "-", "-."):
+        return 0.0
+    v = float(s)
+    return v / 100.0 if v > 1.0 else v
 
 
-def euro_round(x: float) -> int:
-    """Arrondi fiscal à l'euro : >= 0,50 vers le haut."""
-    try:
-        return int(math.floor(x + 0.5)) if x >= 0 else -int(math.floor(abs(x) + 0.5))
-    except Exception:
-        return 0
+def to_csv_bytes(df: pd.DataFrame, sep: str = ";") -> bytes:
+    return df.to_csv(index=False, sep=sep, encoding="utf-8-sig").encode("utf-8-sig")
 
 
-def is_leap_year(year: int) -> bool:
-    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+def check_balance(fec: pd.DataFrame) -> pd.DataFrame:
+    if fec.empty:
+        return pd.DataFrame()
+    chk = fec.groupby(["JournalCode", "EcritureNum"])[["Debit", "Credit"]].sum()
+    chk["Delta"] = (chk["Debit"] - chk["Credit"]).round(2)
+    return chk
 
 
-def days_in_year(year: int) -> int:
-    return 366 if is_leap_year(year) else 365
+# ============================
+# Excel sheets
+# ============================
+def list_sheets(file_bytes: bytes) -> list[str]:
+    bio = BytesIO(file_bytes)
+    xls = pd.ExcelFile(bio, engine="openpyxl")
+    return xls.sheet_names
 
 
-def clamp_date_to_year(d: date, year: int) -> date:
-    if d < date(year, 1, 1):
-        return date(year, 1, 1)
-    if d > date(year, 12, 31):
-        return date(year, 12, 31)
-    return d
+def read_sheet_raw(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    bio = BytesIO(file_bytes)
+    return pd.read_excel(bio, sheet_name=sheet_name, header=None, engine="openpyxl")
 
 
-def overlap_days_in_year(start: date, end: date, year: int) -> int:
-    """Nombre de jours inclusifs entre start et end bornés à l'année."""
-    s = clamp_date_to_year(start, year)
-    e = clamp_date_to_year(end, year)
-    if e < s:
-        return 0
-    return (e - s).days + 1
+# ============================
+# Generic header finder (tolerant)
+# ============================
+def _norm_cell(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace("\u00a0", " ")
+    # rough accent normalization for matching
+    s = s.replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
+    s = s.replace("à", "a").replace("â", "a")
+    s = s.replace("î", "i").replace("ï", "i")
+    s = s.replace("ô", "o")
+    s = s.replace("ù", "u").replace("û", "u").replace("ü", "u")
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
-def json_dumps_safe(obj: Any) -> str:
-    """Sérialisation JSON robuste (dates -> str)."""
-    return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
-
-
-def bracket_progressive_integer(value: int, brackets: List[Tuple[int, int, int]]) -> Tuple[int, List[Dict[str, Any]]]:
+def find_header_row(raw: pd.DataFrame, start_row: int, end_row: int, required_labels: list[str]) -> tuple[int | None, dict]:
     """
-    Calcul progressif par tranches sur une valeur entière.
-    Ex : CV ou autres
+    Find a header row containing all required labels (substring match, accent-tolerant).
+    Return (row_index, {label_norm: col_index})
     """
-    total = 0
-    details: List[Dict[str, Any]] = []
-    v = max(0, safe_int(value, 0))
+    req = [_norm_cell(x) for x in required_labels]
+    for r in range(start_row, min(end_row, len(raw))):
+        row_vals = [_norm_cell(str(x) if str(x).lower() != "nan" else "") for x in raw.iloc[r].tolist()]
+        col_map = {}
+        for label in req:
+            found = None
+            for c, cell in enumerate(row_vals):
+                if label and label in cell:
+                    found = c
+                    break
+            if found is None:
+                col_map = {}
+                break
+            col_map[label] = found
+        if col_map:
+            return r, col_map
+    return None, {}
 
-    for a, b, rate in brackets:
-        if v < a:
+
+# ============================
+# Detect invoices in CAISSE sheet
+# ============================
+def find_facture_rows(raw: pd.DataFrame) -> list[tuple[int, str, str]]:
+    res = []
+    for i in range(len(raw)):
+        row = raw.iloc[i].astype(str).tolist()
+        joined = " | ".join([x for x in row if x and x.lower() != "nan"])
+        m = FACTURE_RE.search(joined)
+        if m:
+            res.append((i, m.group(1), m.group(2)))
+    return res
+
+
+# ============================
+# Extract SALES (articles) from CAISSE sheet
+# ============================
+def extract_sales_lines(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return normalized sales lines:
+    invoice_number, invoice_date, tva_rate, ttc_net (Montant du)
+    """
+    factures = find_facture_rows(raw)
+    if not factures:
+        return pd.DataFrame(columns=["invoice_number", "invoice_date", "tva_rate", "ttc_net", "source_row"])
+
+    factures_with_end = factures + [(len(raw), "", "")]
+    rows = []
+
+    for idx in range(len(factures)):
+        r0, inv, date_str = factures[idx]
+        r1 = factures_with_end[idx + 1][0]
+
+        # Required headers (tolerant)
+        header_row, cols = find_header_row(raw, r0, r1, ["Produits", "TVA", "Montant du"])
+        if header_row is None:
             continue
-        upper = min(v, b)
-        qty = upper - a + 1
-        if qty <= 0:
-            continue
-        part = qty * rate
-        total += part
-        details.append({"tranche": f"{a}–{upper}", "unites": qty, "taux": rate, "montant": part})
-        if v <= b:
-            break
 
-    return total, details
+        c_prod = cols[_norm_cell("Produits")]
+        c_tva = cols[_norm_cell("TVA")]
+        c_mdu = cols[_norm_cell("Montant du")]
 
+        inv_date = datetime.strptime(date_str, "%d/%m/%Y").date()
 
-def bracket_progressive_co2(value: float, brackets: List[Tuple[int, int, int]]) -> Tuple[int, List[Dict[str, Any]]]:
-    """
-    Calcul progressif par gramme CO2.
-    On arrondit la valeur à l'entier le plus proche car la CG donne un entier en général.
-    """
-    v = max(0, int(round(safe_float(value, 0.0))))
-    total = 0
-    details: List[Dict[str, Any]] = []
+        for r in range(header_row + 1, r1):
+            prod = raw.iat[r, c_prod]
+            prod_s = "" if prod is None else str(prod).strip()
+            if prod_s == "" or prod_s.lower() == "nan":
+                continue
 
-    for a, b, rate in brackets:
-        if v < a:
-            continue
-        upper = min(v, b)
-        qty = upper - a + 1
-        if qty <= 0:
-            continue
-        part = qty * rate
-        total += part
-        details.append({"tranche_g": f"{a}–{upper}", "grammes": qty, "taux_€/g": rate, "montant": part})
-        if v <= b:
-            break
+            rate = parse_tva_rate(raw.iat[r, c_tva])
+            ttc_net = parse_eur(raw.iat[r, c_mdu])
 
-    return total, details
-
-
-def ik_coefficient(km: int) -> Tuple[float, str]:
-    k = max(0, safe_int(km, 0))
-    for a, b, coeff, label in IK_COEFF_TABLE:
-        if a <= k <= b:
-            return coeff, label
-    return 1.00, "> 45 000 km => coeff 100 %"
-
-
-def critair_group(label: str) -> str:
-    """
-    Retourne E / 1 / P
-    """
-    txt = (label or "").strip().upper()
-    if txt in {"E", "EV", "ELECTRIQUE", "ÉLECTRIQUE", "HYDROGENE", "HYDROGÈNE", "VERT", "VERTE"}:
-        return "E"
-    if txt in {"1", "CRIT1", "CRIT'1", "CRIT’1", "VIOLET", "VIOLETTE"}:
-        return "1"
-    # tout le reste => P
-    return "P"
-
-
-# ==========================================================
-# MODELES DONNEES
-# ==========================================================
-@dataclass
-class VehicleInput:
-    label: str
-    year: int
-
-    # questionnaire entreprise
-    is_french_company: bool
-    is_entrepreneur_individuel: bool
-    is_osbl_exempt_vat: bool
-
-    # exonérations
-    exempt_usage: bool
-    exempt_disability_adapted: bool
-    exempt_rental_company_vehicle: bool
-    exempt_temporary_replacement: bool
-    exempt_short_rental_le_30d: bool
-
-    # type véhicule
-    vehicle_kind: str  # "M1" / "N1"
-    n1_config_taxable: bool
-
-    # carte grise
-    energy: str  # "Essence", "Diesel", "Hybride", "GPL/GNV", "EV/H2"
-    co2_norm: str  # "WLTP", "NEDC", "PA"
-    co2_value: Optional[float]
-    fiscal_power_cv: Optional[int]
-    critair_label: str
-
-    # E85
-    has_e85: bool
-
-    # affectation
-    affect_start: date
-    affect_end: date
-
-    # IK
-    is_ik_vehicle: bool
-    ik_km_reimbursed: int
-
-    # minoration flotte
-    is_non_owned_with_expenses: bool
-
-
-@dataclass
-class VehicleResult:
-    taxable: bool
-    reason: str
-
-    days: int
-    proportion: float
-    ik_coeff: float
-
-    co2_mode: str
-    co2_input: Optional[float]
-    co2_base_used: float
-    co2_tariff: int
-    co2_tranches: List[Dict[str, Any]]
-    e85_note: Optional[str]
-    co2_warning: Optional[str]
-
-    poll_group: str
-    poll_tariff: int
-
-    annual_total_before_prorata: int
-    total_before_rounding: float
-    total_rounded: int
-
-    is_non_owned_with_expenses: bool
-
-    details: Dict[str, Any]
-
-
-# ==========================================================
-# MOTEUR D'ASSUJETTISSEMENT + CALCUL
-# ==========================================================
-def determine_taxability(v: VehicleInput) -> Tuple[bool, str]:
-    if not v.is_french_company:
-        return False, "Non calculé : app France uniquement (entreprise non française)."
-
-    # Exonérations entreprise
-    if v.is_entrepreneur_individuel:
-        return False, "Exonération : entrepreneur individuel (EI)."
-    if v.is_osbl_exempt_vat:
-        return False, "Exonération : OSBL d’intérêt général exonéré de TVA."
-
-    # Type véhicule
-    if v.vehicle_kind == "N1" and not v.n1_config_taxable:
-        return False, "Non assujetti : N1 non assimilé véhicule de tourisme (configuration non taxable)."
-
-    # Exonérations usage / situation
-    if v.exempt_usage:
-        return False, "Exonération : usage exonéré (taxi/VTC, transport public, auto-école, agricole/forestier, compétition…)."
-    if v.exempt_disability_adapted:
-        return False, "Exonération : véhicule aménagé handicap."
-    if v.exempt_rental_company_vehicle:
-        return False, "Exonération : véhicule affecté à l’activité de location (au bénéfice du loueur)."
-    if v.exempt_temporary_replacement:
-        return False, "Exonération : véhicule prêté temporairement en remplacement (garage)."
-    if v.exempt_short_rental_le_30d:
-        return False, "Exonération : location ≤ 30 jours consécutifs / 1 mois."
-
-    # Exonération énergie
-    if v.energy == "EV/H2":
-        return False, "Exonération : motorisation 100 % électrique et/ou hydrogène (0€ CO₂ et 0€ polluants)."
-
-    return True, "Assujetti : véhicule de tourisme affecté à des fins économiques (aucune exonération détectée)."
-
-
-def compute_co2_tariff(v: VehicleInput) -> Tuple[int, float, List[Dict[str, Any]], Optional[str], Optional[str]]:
-    """
-    Retourne (tarif_co2_annuel, base_utilisée, detail_tranches, note_e85, warning)
-    """
-    mode = (v.co2_norm or "WLTP").upper().strip()
-    if mode not in {"WLTP", "NEDC", "PA"}:
-        mode = "WLTP"
-
-    note_e85: Optional[str] = None
-    warning: Optional[str] = None
-
-    # base init
-    co2_val = v.co2_value if v.co2_value is not None else None
-    cv_val = v.fiscal_power_cv if v.fiscal_power_cv is not None else None
-
-    # Abattement E85 : -40% CO2 si <= 250 ; -2 CV si PA et CV <= 12
-    if v.has_e85:
-        if mode in {"WLTP", "NEDC"}:
-            if co2_val is None:
-                warning = "E85 coché, mais CO₂ absent : impossible d'appliquer l'abattement CO₂."
-            else:
-                if co2_val <= 250:
-                    co2_val = co2_val * 0.60
-                    note_e85 = f"E85 : abattement -40% sur CO₂ (CO₂ <= 250) => CO₂ retenu = {co2_val:.1f} g/km"
-                else:
-                    note_e85 = "E85 : pas d’abattement (CO₂ > 250 g/km)"
-        else:  # PA
-            if cv_val is None:
-                warning = "E85 coché, mais puissance fiscale absente : impossible d'appliquer -2 CV."
-            else:
-                if cv_val <= 12:
-                    cv_val = max(0, cv_val - 2)
-                    note_e85 = f"E85 : abattement -2 CV (CV <= 12) => CV retenus = {cv_val}"
-                else:
-                    note_e85 = "E85 : pas d’abattement (CV > 12)"
-
-    # Calcul barème
-    if mode == "WLTP":
-        if co2_val is None:
-            warning = warning or "Mode WLTP choisi mais CO₂ absent : tarif CO₂ forcé à 0 (à vérifier)."
-            return 0, 0.0, [], note_e85, warning
-        tariff, tr = bracket_progressive_co2(co2_val, WLTP_2026)
-        return tariff, float(co2_val), tr, note_e85, warning
-
-    if mode == "NEDC":
-        if co2_val is None:
-            warning = warning or "Mode NEDC choisi mais CO₂ absent : tarif CO₂ forcé à 0 (à vérifier)."
-            return 0, 0.0, [], note_e85, warning
-        tariff, tr = bracket_progressive_co2(co2_val, NEDC_2026)
-        return tariff, float(co2_val), tr, note_e85, warning
-
-    # PA
-    if cv_val is None or cv_val <= 0:
-        warning = warning or "Mode PA (puissance fiscale) : CV absents ou nuls => tarif CO₂ forcé à 0 (à vérifier)."
-        return 0, 0.0, [], note_e85, warning
-
-    tariff, tr = bracket_progressive_integer(int(cv_val), PA_2026)
-    return tariff, float(cv_val), tr, note_e85, warning
-
-
-def compute_pollutants_tariff(v: VehicleInput) -> Tuple[int, str]:
-    # énergie EV/H2 : groupe E
-    if v.energy == "EV/H2":
-        return 0, "E"
-    g = critair_group(v.critair_label)
-    return POLLUTANTS_2026.get(g, 500), g
-
-
-def compute_vehicle(v: VehicleInput) -> VehicleResult:
-    taxable, reason = determine_taxability(v)
-
-    # affectation
-    d = overlap_days_in_year(v.affect_start, v.affect_end, v.year)
-    denom = days_in_year(v.year)
-    prop = (d / denom) if denom else 0.0
-
-    # IK coeff
-    ik_coeff = 1.0
-    ik_note = None
-    if v.is_ik_vehicle:
-        ik_coeff, ik_note = ik_coefficient(v.ik_km_reimbursed)
-
-    if not taxable:
-        details = {
-            "assujettissement": {"taxable": False, "raison": reason},
-            "affectation": {
-                "annee": v.year,
-                "debut": str(v.affect_start),
-                "fin": str(v.affect_end),
-                "jours": d,
-                "jours_dans_annee": denom,
-                "proportion": prop,
-            },
-            "ik": {
-                "actif": v.is_ik_vehicle,
-                "km": v.ik_km_reimbursed,
-                "coeff": ik_coeff,
-                "regle": ik_note,
-            },
-            "resultat": {"total_arrondi": 0},
-        }
-        return VehicleResult(
-            taxable=False,
-            reason=reason,
-            days=d,
-            proportion=prop,
-            ik_coeff=ik_coeff,
-            co2_mode=v.co2_norm,
-            co2_input=v.co2_value,
-            co2_base_used=0.0,
-            co2_tariff=0,
-            co2_tranches=[],
-            e85_note=None,
-            co2_warning=None,
-            poll_group="",
-            poll_tariff=0,
-            annual_total_before_prorata=0,
-            total_before_rounding=0.0,
-            total_rounded=0,
-            is_non_owned_with_expenses=v.is_non_owned_with_expenses,
-            details=details,
-        )
-
-    # CO2 + Polluants
-    co2_tariff, co2_base, co2_tr, e85_note, co2_warning = compute_co2_tariff(v)
-    poll_tariff, poll_group = compute_pollutants_tariff(v)
-
-    annual_total = int(co2_tariff + poll_tariff)
-
-    total = annual_total * prop * ik_coeff
-    total_rounded = euro_round(total)
-
-    details = {
-        "assujettissement": {"taxable": True, "raison": reason},
-        "carte_grise": {
-            "energie": v.energy,
-            "co2_norme": v.co2_norm,
-            "co2_saisi": v.co2_value,
-            "puissance_cv": v.fiscal_power_cv,
-            "critair": v.critair_label,
-            "e85": v.has_e85,
-        },
-        "affectation": {
-            "annee": v.year,
-            "debut": str(v.affect_start),
-            "fin": str(v.affect_end),
-            "jours": d,
-            "jours_dans_annee": denom,
-            "proportion": prop,
-        },
-        "co2": {
-            "tarif_annuel": co2_tariff,
-            "base_retendue": co2_base,
-            "detail_tranches": co2_tr,
-            "note_e85": e85_note,
-            "warning": co2_warning,
-        },
-        "polluants": {
-            "groupe": poll_group,
-            "tarif_annuel": poll_tariff,
-            "regle": "E=0€, Crit’Air 1=100€, autres=500€ (2026)",
-        },
-        "ik": {
-            "actif": v.is_ik_vehicle,
-            "km": v.ik_km_reimbursed,
-            "coeff": ik_coeff,
-            "regle": ik_note,
-        },
-        "calcul": {
-            "annuel_avant_prorata": annual_total,
-            "total_avant_arrondi": total,
-            "total_arrondi": total_rounded,
-            "arrondi": "Arrondi à l’euro le plus proche (>=0,50 vers le haut).",
-        },
-        "minoration_15000": {
-            "eligible": v.is_non_owned_with_expenses,
-            "note": "Applicable au niveau flotte sur les véhicules 'non détenus + frais pris en charge'.",
-        },
-    }
-
-    return VehicleResult(
-        taxable=True,
-        reason=reason,
-        days=d,
-        proportion=prop,
-        ik_coeff=ik_coeff,
-        co2_mode=v.co2_norm,
-        co2_input=v.co2_value,
-        co2_base_used=co2_base,
-        co2_tariff=co2_tariff,
-        co2_tranches=co2_tr,
-        e85_note=e85_note,
-        co2_warning=co2_warning,
-        poll_group=poll_group,
-        poll_tariff=poll_tariff,
-        annual_total_before_prorata=annual_total,
-        total_before_rounding=total,
-        total_rounded=total_rounded,
-        is_non_owned_with_expenses=v.is_non_owned_with_expenses,
-        details=details,
-    )
-
-
-# ==========================================================
-# UI : ETAT SESSION
-# ==========================================================
-if "fleet" not in st.session_state:
-    st.session_state["fleet"] = []  # list of {"input":..., "result":...}
-
-if "last_vehicle" not in st.session_state:
-    st.session_state["last_vehicle"] = None
-if "last_result" not in st.session_state:
-    st.session_state["last_result"] = None
-
-
-# ==========================================================
-# UI : EN-TÊTE
-# ==========================================================
-st.title("Calcul taxe annuelle sur l’affectation des véhicules de tourisme (ex-TVS) — Barèmes 2026")
-st.caption("App France uniquement • Questionnaire d’assujettissement • Détail complet des calculs (CO₂ + Polluants).")
-
-tabs = st.tabs(["Questionnaire & carte grise", "Résultat (détail)", "Parc véhicules + minoration 15 000 €"])
-
-
-# ==========================================================
-# TAB 1 : SAISIE
-# ==========================================================
-with tabs[0]:
-    st.subheader("1) Questionnaire d’assujettissement (entreprise / usage / type de véhicule)")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        is_french_company = st.checkbox("Entreprise française (France uniquement)", value=True)
-        is_entrepreneur_individuel = st.checkbox("Entrepreneur individuel (EI) — exonéré", value=False)
-        is_osbl_exempt_vat = st.checkbox("OSBL d’intérêt général exonéré de TVA — exonéré", value=False)
-
-    with c2:
-        exempt_usage = st.checkbox("Usage exonéré (taxi/VTC, transport public, auto-école, agricole/forestier, compétition)", value=False)
-        exempt_disability_adapted = st.checkbox("Véhicule aménagé handicap — exonéré", value=False)
-
-    with c3:
-        exempt_rental_company_vehicle = st.checkbox("Véhicule affecté à la location (au bénéfice du loueur) — exonéré", value=False)
-        exempt_temporary_replacement = st.checkbox("Véhicule de remplacement (garage) — exonéré", value=False)
-        exempt_short_rental_le_30d = st.checkbox("Location ≤ 30 jours consécutifs (ou 1 mois) — exonéré", value=False)
-
-    st.divider()
-    st.subheader("2) Type de véhicule (pour savoir si c’est un véhicule de tourisme taxable)")
-
-    colA, colB = st.columns([1, 2])
-    with colA:
-        vehicle_kind_ui = st.selectbox("Catégorie du véhicule", ["M1 (VP - voiture particulière)", "N1 (utilitaire léger)"])
-
-    vehicle_kind = "M1" if vehicle_kind_ui.startswith("M1") else "N1"
-    n1_config_taxable = True
-
-    with colB:
-        if vehicle_kind == "N1":
-            n1_config_taxable = st.checkbox(
-                "N1 assimilé à véhicule de tourisme (ex : pick-up double cabine ≥5 places, fourgonnette 'passagers')",
-                value=False,
-            )
-        else:
-            st.info("M1 : considéré véhicule de tourisme.")
-
-    st.caption("N1 n’est taxable que s’il est assimilé à un véhicule de tourisme.")
-
-    st.divider()
-    st.subheader("3) Données carte grise (CO₂ / norme / Crit’Air / énergie / puissance fiscale)")
-
-    today = date.today()
-    default_year = today.year - 1  # en pratique déclaration en N+1
-    row1, row2, row3, row4 = st.columns(4)
-
-    with row1:
-        label = st.text_input("Libellé véhicule (ex : 'Peugeot 308 - AB-123-CD')", value="Véhicule 1")
-        energy = st.selectbox("Énergie", ["Essence", "Diesel", "Hybride", "GPL/GNV", "EV/H2"])
-        has_e85 = st.checkbox("Carburant E85 (exclusif ou partiel)", value=False)
-
-    with row2:
-        co2_norm_ui = st.selectbox("Norme CO₂ (selon carte grise)", ["WLTP", "NEDC", "PA (pas de CO₂ => puissance fiscale)"])
-        co2_norm = "PA" if co2_norm_ui.startswith("PA") else co2_norm_ui
-
-        co2_value: Optional[float] = None
-        if co2_norm in {"WLTP", "NEDC"}:
-            co2_value = st.number_input("CO₂ (g/km) — champ V.7", min_value=0.0, value=100.0, step=1.0)
-
-        fiscal_power_cv = st.number_input("Puissance fiscale (CV) — champ P.6", min_value=0, value=6, step=1)
-
-    with row3:
-        critair_label = st.selectbox("Crit’Air", ["1", "2", "3", "4", "5", "Non classé", "E"])
-        st.caption("Polluants : E=0€, Crit’Air 1=100€, autres=500€ (2026).")
-
-    with row4:
-        year = st.number_input("Année d’affectation (année N)", min_value=2022, value=int(default_year), step=1)
-        st.caption("La taxe est calculée sur l’année d’affectation (N), déclarée ensuite en N+1.")
-
-    st.divider()
-    st.subheader("4) Affectation dans l’année (proratisation)")
-
-    # valeurs par défaut cohérentes avec l'année choisie
-    default_start = date(int(year), 1, 1)
-    default_end = date(int(year), 12, 31)
-
-    d1, d2, d3 = st.columns(3)
-    with d1:
-        affect_start = st.date_input("Début d’affectation", value=default_start)
-    with d2:
-        affect_end = st.date_input("Fin d’affectation", value=default_end)
-    with d3:
-        st.info("Prorata = nb jours affectés / nb jours dans l’année.")
-
-    if affect_end < affect_start:
-        st.error("La date de fin d’affectation ne peut pas être antérieure à la date de début.")
-        st.stop()
-
-    st.divider()
-    st.subheader("5) Cas indemnités kilométriques (véhicule non détenu, remboursement km)")
-
-    is_ik_vehicle = st.checkbox("Véhicule concerné par remboursement de frais kilométriques (IK)", value=False)
-    ik_km_reimbursed = 0
-    if is_ik_vehicle:
-        ik_km_reimbursed = int(st.number_input("Km remboursés sur l’année", min_value=0, value=12000, step=1000))
-        coeff, msg = ik_coefficient(ik_km_reimbursed)
-        st.info(f"Coefficient IK appliqué : {coeff:.2f} — {msg}")
-
-    st.divider()
-    st.subheader("6) Cas minoration 15 000 € (niveau flotte)")
-
-    is_non_owned_with_expenses = st.checkbox(
-        "Véhicule non détenu + frais d’utilisation/acquisition pris en charge (éligible à la minoration 15 000 € sur le TOTAL flotte)",
-        value=False,
-    )
-
-    st.divider()
-
-    if st.button("Calculer et afficher le détail", type="primary"):
-        v = VehicleInput(
-            label=label.strip() or "Véhicule",
-            year=int(year),
-
-            is_french_company=is_french_company,
-            is_entrepreneur_individuel=is_entrepreneur_individuel,
-            is_osbl_exempt_vat=is_osbl_exempt_vat,
-
-            exempt_usage=exempt_usage,
-            exempt_disability_adapted=exempt_disability_adapted,
-            exempt_rental_company_vehicle=exempt_rental_company_vehicle,
-            exempt_temporary_replacement=exempt_temporary_replacement,
-            exempt_short_rental_le_30d=exempt_short_rental_le_30d,
-
-            vehicle_kind=vehicle_kind,
-            n1_config_taxable=n1_config_taxable,
-
-            energy=energy,
-            co2_norm=co2_norm,
-            co2_value=float(co2_value) if co2_value is not None else None,
-            fiscal_power_cv=int(fiscal_power_cv),
-            critair_label=critair_label,
-
-            has_e85=has_e85,
-
-            affect_start=affect_start,
-            affect_end=affect_end,
-
-            is_ik_vehicle=is_ik_vehicle,
-            ik_km_reimbursed=int(ik_km_reimbursed),
-
-            is_non_owned_with_expenses=is_non_owned_with_expenses,
-        )
-
-        res = compute_vehicle(v)
-        st.session_state["last_vehicle"] = v
-        st.session_state["last_result"] = res
-        st.success("Calcul effectué. Va dans l’onglet « Résultat (détail) ».")
-
-    st.caption("Astuce : ajoute ensuite le véhicule au parc dans l’onglet 3 (multi véhicules + minoration 15k).")
-
-
-# ==========================================================
-# TAB 2 : RESULTAT DETAIL
-# ==========================================================
-with tabs[1]:
-    st.subheader("Résultat — détail pas-à-pas")
-
-    v: Optional[VehicleInput] = st.session_state.get("last_vehicle")
-    res: Optional[VehicleResult] = st.session_state.get("last_result")
-
-    if v is None or res is None:
-        st.info("Fais un calcul dans l’onglet « Questionnaire & carte grise ».")
-    else:
-        a, b, c = st.columns([2, 2, 3])
-        with a:
-            st.metric("Véhicule", v.label)
-            st.write(f"**Assujetti :** {'OUI' if res.taxable else 'NON'}")
-            st.write(res.reason)
-
-        with b:
-            st.metric("Montant (arrondi)", f"{res.total_rounded} €")
-            st.write(f"CO₂ annuel : **{res.co2_tariff} €**")
-            st.write(f"Polluants annuel : **{res.poll_tariff} €**")
-
-        with c:
-            st.write("**Facteurs appliqués**")
-            st.write(f"- Jours affectés : {res.days} j")
-            st.write(f"- Proportion : {res.proportion:.6f}")
-            st.write(f"- Coefficient IK : {res.ik_coeff:.2f}")
-
-        st.divider()
-        st.write("## Détail du calcul")
-
-        # A - affectation
-        aff = res.details.get("affectation", {})
-        st.write("### A) Proratisation (affectation)")
-        st.write(f"Période : **{aff.get('debut')}** → **{aff.get('fin')}**")
-        st.write(f"Jours retenus : **{aff.get('jours')}** / {aff.get('jours_dans_annee')} => proportion **{aff.get('proportion'):.6f}**")
-
-        # B - CO2
-        st.write("### B) Taxe CO₂ (barème 2026)")
-        co2 = res.details.get("co2", {})
-        st.write(f"Mode : **{v.co2_norm}**")
-
-        if v.co2_norm in {"WLTP", "NEDC"}:
-            st.write(f"CO₂ saisi : **{v.co2_value if v.co2_value is not None else '—'} g/km**")
-            st.write(f"CO₂ retenu : **{co2.get('base_retendue')}**")
-        else:
-            st.write(f"Puissance fiscale saisie : **{v.fiscal_power_cv} CV**")
-            st.write(f"CV retenus : **{co2.get('base_retendue')}**")
-
-        if co2.get("note_e85"):
-            st.info(co2.get("note_e85"))
-        if co2.get("warning"):
-            st.warning(co2.get("warning"))
-
-        tr = co2.get("detail_tranches", [])
-        if isinstance(tr, list) and len(tr) > 0:
-            st.write("Détail par tranches :")
-            st.dataframe(pd.DataFrame(tr), use_container_width=True, hide_index=True)
-
-        st.write(f"➡️ **Tarif CO₂ annuel = {co2.get('tarif_annuel', 0)} €**")
-
-        # C - polluants
-        st.write("### C) Taxe polluants (barème 2026)")
-        pol = res.details.get("polluants", {})
-        st.write(f"Crit’Air saisi : **{v.critair_label}**")
-        st.write(f"Groupe retenu : **{pol.get('groupe')}** (E=0€, 1=100€, autres=500€)")
-        st.write(f"➡️ **Tarif polluants annuel = {pol.get('tarif_annuel', 0)} €**")
-
-        # D - somme
-        st.write("### D) Somme annuelle avant prorata")
-        calc = res.details.get("calcul", {})
-        st.write(f"Annuel avant prorata = **{calc.get('annuel_avant_prorata', 0)} €**")
-
-        # E - IK
-        st.write("### E) Coefficient IK")
-        ik = res.details.get("ik", {})
-        if ik.get("actif"):
-            st.write(f"Km remboursés : **{ik.get('km')}**")
-            st.write(f"Règle : {ik.get('regle')}")
-        else:
-            st.write("Non applicable (pas de remboursement IK déclaré).")
-        st.write(f"➡️ **Coeff IK = {ik.get('coeff', 1.0)}**")
-
-        # F - final
-        st.write("### F) Calcul final + arrondi")
-        st.code(
-            f"Total = Annuel({calc.get('annuel_avant_prorata', 0)}) x Proportion({res.proportion:.6f}) x CoeffIK({res.ik_coeff:.2f})\n"
-            f"     = {res.total_before_rounding:.2f} €  -> arrondi => {res.total_rounded} €\n"
-            f"Règle : {calc.get('arrondi')}",
-            language="text",
-        )
-
-        # note minoration
-        if res.is_non_owned_with_expenses:
-            st.warning("⚠️ Ce véhicule est marqué éligible à la minoration 15 000 € (appliquée au niveau flotte dans l’onglet 3).")
-
-        st.divider()
-
-        # actions
-        left, right = st.columns(2)
-
-        with left:
-            if st.button("➕ Ajouter ce véhicule au parc (onglet 3)"):
-                st.session_state["fleet"].append({"input": asdict(v), "result": asdict(res)})
-                st.success("Ajouté au parc.")
-
-        with right:
-            json_data = json_dumps_safe(res.details)
-            st.download_button(
-                "Télécharger le détail (JSON)",
-                data=json_data,
-                file_name=f"detail_calcul_{v.label.replace(' ', '_')}.json",
-                mime="application/json",
-            )
-
-
-# ==========================================================
-# TAB 3 : PARC + MINORATION 15 000 €
-# ==========================================================
-with tabs[2]:
-    st.subheader("Parc véhicules + minoration 15 000 €")
-
-    fleet: List[Dict[str, Any]] = st.session_state.get("fleet", [])
-
-    if not fleet:
-        st.info("Parc vide. Fais un calcul (onglet 1) puis ajoute le véhicule depuis l’onglet 2.")
-    else:
-        rows = []
-        for i, item in enumerate(fleet, start=1):
-            vin = item.get("input", {})
-            r = item.get("result", {})
+            if abs(ttc_net) < 1e-9:
+                continue
 
             rows.append({
-                "#": i,
-                "Véhicule": vin.get("label", f"Véhicule {i}"),
-                "Année": vin.get("year"),
-                "Assujetti": "OUI" if r.get("taxable") else "NON",
-                "Montant arrondi (€)": safe_int(r.get("total_rounded"), 0),
-                "Éligible minoration 15k": "OUI" if vin.get("is_non_owned_with_expenses") else "NON",
-                "Énergie": vin.get("energy"),
-                "Norme CO₂": vin.get("co2_norm"),
-                "CO₂": vin.get("co2_value"),
-                "CV": vin.get("fiscal_power_cv"),
-                "Crit’Air": vin.get("critair_label"),
+                "invoice_number": str(inv),
+                "invoice_date": inv_date,
+                "tva_rate": round(float(rate), 6),
+                "ttc_net": round(float(ttc_net), 2),
+                "source_row": r
             })
 
-        df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+    return pd.DataFrame(rows)
 
-        total_all = float(df["Montant arrondi (€)"].sum())
 
-        elig_df = df[df["Éligible minoration 15k"] == "OUI"]
-        elig_total = float(elig_df["Montant arrondi (€)"].sum())
+# ============================
+# Extract PAYMENTS from CAISSE sheet
+# ============================
+def extract_encaissements(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return normalized payments:
+    invoice_number, invoice_date, amount, mode
+    """
+    factures = find_facture_rows(raw)
+    if not factures:
+        return pd.DataFrame(columns=["invoice_number", "invoice_date", "amount", "mode", "source_row"])
 
-        minoration = min(15000.0, elig_total)
-        elig_net = max(0.0, elig_total - minoration)
+    factures_with_end = factures + [(len(raw), "", "")]
+    rows = []
 
-        total_net = (total_all - elig_total) + elig_net
+    for idx in range(len(factures)):
+        r0, inv, date_str = factures[idx]
+        r1 = factures_with_end[idx + 1][0]
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total parc (arrondi)", f"{int(total_all)} €")
-        c2.metric("Sous-total éligible 15k", f"{int(elig_total)} €")
-        c3.metric("Minoration appliquée", f"{int(minoration)} €")
-        c4.metric("Total parc net", f"{int(total_net)} €")
+        header_row, cols = find_header_row(raw, r0, r1, ["Montant encaissé", "Mode de règlement"])
+        if header_row is None:
+            continue
 
-        st.write("### Détail minoration (niveau flotte)")
-        st.code(
-            f"Sous-total éligible = {int(elig_total)} €\n"
-            f"Minoration = min(15 000, {int(elig_total)}) = {int(minoration)} €\n"
-            f"Sous-total éligible net = {int(elig_net)} €\n"
-            f"Total net = (Total parc - Sous-total éligible) + Sous-total éligible net\n"
-            f"         = ({int(total_all)} - {int(elig_total)}) + {int(elig_net)}\n"
-            f"         = {int(total_net)} €",
-            language="text",
-        )
+        c_amt = cols[_norm_cell("Montant encaissé")]
+        c_mode = cols[_norm_cell("Mode de règlement")]
 
-        st.divider()
-        left, right = st.columns(2)
-        with left:
-            if st.button("🧹 Vider le parc"):
-                st.session_state["fleet"] = []
-                st.success("Parc vidé (rafraîchis la page si besoin).")
+        inv_date = datetime.strptime(date_str, "%d/%m/%Y").date()
 
-        with right:
-            st.download_button(
-                "Télécharger le parc (CSV)",
-                data=df.to_csv(index=False).encode("utf-8"),
-                file_name="parc_vehicules_taxe.csv",
-                mime="text/csv",
-            )
+        for r in range(header_row + 1, r1):
+            amt = parse_eur(raw.iat[r, c_amt])
+            md = normalize_mode(raw.iat[r, c_mode])
+            if md and abs(amt) > 1e-9:
+                rows.append({
+                    "invoice_number": str(inv),
+                    "invoice_date": inv_date,
+                    "amount": round(float(amt), 2),
+                    "mode": md,
+                    "source_row": r
+                })
 
-st.caption(
-    "Implémentation robuste : JSON via json.dumps, validation dates, champs optionnels sécurisés, "
-    "barèmes 2026 (CO₂ WLTP/NEDC/PA + polluants E/1/autres) + prorata jours + coeff IK + abattement E85 + minoration 15k flotte."
+    return pd.DataFrame(rows)
+
+
+# ============================
+# Extract CHECK deposits from CHEQUES sheet
+# ============================
+def extract_remises_cheques(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return:
+    bordereau_id, remise_date, total_montant
+    """
+    starts = []
+    for i in range(len(raw)):
+        row = raw.iloc[i].astype(str).tolist()
+        joined = " | ".join([x for x in row if x and x.lower() != "nan"])
+        m = BORDEREAU_RE.search(joined)
+        if m:
+            starts.append((i, m.group(1), m.group(2)))
+
+    if not starts:
+        return pd.DataFrame(columns=["bordereau_id", "remise_date", "total_montant"])
+
+    starts_with_end = starts + [(len(raw), "", "")]
+    rows = []
+
+    for k in range(len(starts)):
+        r0, bid, dstr = starts[k]
+        r1 = starts_with_end[k + 1][0]
+        remise_date = datetime.strptime(dstr, "%d/%m/%Y").date()
+
+        # find header with Date + Montant(€)
+        header_row, cols = find_header_row(raw, r0, r1, ["Date", "Montant"])
+        if header_row is None:
+            continue
+        c_montant = cols[_norm_cell("Montant")]
+
+        total = 0.0
+        for r in range(header_row + 1, r1):
+            line = " ".join([str(x) for x in raw.iloc[r].tolist() if str(x).lower() != "nan"]).lower()
+            if "nombre de cheque" in line or "nombre de ch" in line:
+                break
+            amt = parse_eur(raw.iat[r, c_montant])
+            if abs(amt) > 1e-9:
+                total += amt
+
+        total = round(total, 2)
+        if abs(total) > 0.009:
+            rows.append({"bordereau_id": str(bid), "remise_date": remise_date, "total_montant": total})
+
+    return pd.DataFrame(rows)
+
+
+# ============================
+# Extract CASH deposits from ESPECES sheet
+# ============================
+def extract_remises_especes(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Table:
+    N° bordereau | Statut (contains date) | Montant
+    """
+    header_row, cols = find_header_row(raw, 0, len(raw), ["N° bordereau", "Statut", "Montant"])
+    if header_row is None:
+        return pd.DataFrame(columns=["bordereau_id", "remise_date", "total_montant"])
+
+    c_bord = cols[_norm_cell("N° bordereau")]
+    c_stat = cols[_norm_cell("Statut")]
+    c_mont = cols[_norm_cell("Montant")]
+
+    rows = []
+    for r in range(header_row + 1, len(raw)):
+        bord = raw.iat[r, c_bord]
+        if bord is None or str(bord).strip() == "" or str(bord).lower() == "nan":
+            continue
+
+        # stop on total line
+        if "total" in str(bord).strip().lower():
+            break
+
+        statut = str(raw.iat[r, c_stat])
+        m = re.search(r"(\d{2}/\d{2}/\d{4})", statut)
+        if not m:
+            continue
+        dt = datetime.strptime(m.group(1), "%d/%m/%Y").date()
+
+        amt = round(parse_eur(raw.iat[r, c_mont]), 2)
+        if abs(amt) > 0.009:
+            rows.append({"bordereau_id": str(bord).strip(), "remise_date": dt, "total_montant": amt})
+
+    return pd.DataFrame(rows)
+
+
+# ============================
+# Build FEC - SALES (Debit 53 / Credit 70 + TVA)
+# ============================
+def build_vat_map_from_csv(text: str) -> dict:
+    """
+    Text CSV format with ';' separator:
+    TauxTVA;Compte70;Lib70;CompteTVA;LibTVA
+    """
+    text = (text or "").strip()
+    if not text:
+        return {}
+
+    df = pd.read_csv(BytesIO(text.encode("utf-8")), sep=";")
+    vat_map = {}
+    for _, r in df.iterrows():
+        try:
+            rate = round(float(r["TauxTVA"]), 6)
+        except Exception:
+            continue
+        vat_map[rate] = {
+            "rev_acc": str(r.get("Compte70", "")).strip(),
+            "rev_lib": str(r.get("Lib70", "")).strip(),
+            "vat_acc": str(r.get("CompteTVA", "")).strip(),
+            "vat_lib": str(r.get("LibTVA", "")).strip(),
+        }
+    return vat_map
+
+
+def build_mode_map_from_csv(text: str) -> tuple[dict, dict]:
+    """
+    Text CSV format with ';' separator:
+    Mode;CompteNum;CompteLib
+    """
+    text = (text or "").strip()
+    if not text:
+        return {}, {}
+
+    df = pd.read_csv(BytesIO(text.encode("utf-8")), sep=";")
+    acc = {}
+    lib = {}
+    for _, r in df.iterrows():
+        md = normalize_mode(r.get("Mode", ""))
+        if not md:
+            continue
+        acc[md] = str(r.get("CompteNum", "")).strip()
+        lib[md] = str(r.get("CompteLib", "")).strip()
+    return acc, lib
+
+
+def build_fec_sales(sales_lines: pd.DataFrame,
+                    journal_code: str,
+                    journal_lib: str,
+                    compte_53: str,
+                    lib_53: str,
+                    vat_map: dict,
+                    group_per_invoice_and_rate: bool = True) -> pd.DataFrame:
+    if sales_lines.empty:
+        return pd.DataFrame(columns=FEC_COLUMNS)
+
+    df = sales_lines.copy()
+    if group_per_invoice_and_rate:
+        df = df.groupby(["invoice_number", "invoice_date", "tva_rate"], as_index=False)["ttc_net"].sum()
+
+    fec_rows = []
+
+    for _, row in df.iterrows():
+        inv = str(row["invoice_number"])
+        dt = row["invoice_date"]
+        rate = round(float(row["tva_rate"]), 6)
+        ttc = round(float(row["ttc_net"]), 2)
+
+        if rate not in vat_map:
+            continue
+
+        ht = ttc / (1.0 + rate) if (1.0 + rate) != 0 else ttc
+        tva = ttc - ht
+        ht = round(ht, 2)
+        tva = round(tva, 2)
+
+        rev_acc = vat_map[rate]["rev_acc"]
+        rev_lib = vat_map[rate]["rev_lib"]
+        vat_acc = vat_map[rate]["vat_acc"]
+        vat_lib = vat_map[rate]["vat_lib"]
+
+        ecriture_num = f"{inv}-VT"
+        lib = f"Vente facture {inv} TVA {rate*100:.2f}%"
+
+        # Debit 53 TTC
+        fec_rows.append({
+            "JournalCode": journal_code, "JournalLib": journal_lib,
+            "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
+            "CompteNum": compte_53, "CompteLib": lib_53,
+            "CompAuxNum": "", "CompAuxLib": "",
+            "PieceRef": inv, "PieceDate": dt.strftime("%Y%m%d"),
+            "EcritureLib": lib,
+            "Debit": ttc, "Credit": 0.0,
+            "EcritureLet": "", "DateLet": "",
+            "ValidDate": dt.strftime("%Y%m%d"),
+            "Montantdevise": "", "Idevise": ""
+        })
+
+        # Credit 70 HT
+        fec_rows.append({
+            "JournalCode": journal_code, "JournalLib": journal_lib,
+            "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
+            "CompteNum": rev_acc, "CompteLib": rev_lib,
+            "CompAuxNum": "", "CompAuxLib": "",
+            "PieceRef": inv, "PieceDate": dt.strftime("%Y%m%d"),
+            "EcritureLib": lib,
+            "Debit": 0.0, "Credit": ht,
+            "EcritureLet": "", "DateLet": "",
+            "ValidDate": dt.strftime("%Y%m%d"),
+            "Montantdevise": "", "Idevise": ""
+        })
+
+        # Credit TVA
+        if abs(tva) > 0.009:
+            fec_rows.append({
+                "JournalCode": journal_code, "JournalLib": journal_lib,
+                "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
+                "CompteNum": vat_acc, "CompteLib": vat_lib,
+                "CompAuxNum": "", "CompAuxLib": "",
+                "PieceRef": inv, "PieceDate": dt.strftime("%Y%m%d"),
+                "EcritureLib": lib,
+                "Debit": 0.0, "Credit": tva,
+                "EcritureLet": "", "DateLet": "",
+                "ValidDate": dt.strftime("%Y%m%d"),
+                "Montantdevise": "", "Idevise": ""
+            })
+
+    fec = pd.DataFrame(fec_rows, columns=FEC_COLUMNS)
+    for col in ["Debit", "Credit"]:
+        fec[col] = pd.to_numeric(fec[col], errors="coerce").fillna(0.0).round(2)
+    return fec
+
+
+# ============================
+# Build FEC - PAYMENTS (Debit règlement / Credit 53)
+# ============================
+def build_fec_settlements(enc_df: pd.DataFrame,
+                          journal_code: str,
+                          journal_lib: str,
+                          compte_53: str,
+                          lib_53: str,
+                          mode_to_debit_account: dict,
+                          mode_to_debit_lib: dict,
+                          group_same_mode_per_invoice: bool = True) -> pd.DataFrame:
+    if enc_df.empty:
+        return pd.DataFrame(columns=FEC_COLUMNS)
+
+    df = enc_df.copy()
+    if group_same_mode_per_invoice:
+        df = df.groupby(["invoice_number", "invoice_date", "mode"], as_index=False)["amount"].sum()
+
+    fec_rows = []
+    for _, row in df.iterrows():
+        inv = str(row["invoice_number"])
+        dt = row["invoice_date"]
+        mode = row["mode"]
+        amt = round(float(row["amount"]), 2)
+
+        debit_acc = mode_to_debit_account.get(mode, "")
+        debit_lib = mode_to_debit_lib.get(mode, f"Règlement {mode}".strip())
+        if not debit_acc:
+            continue
+
+        ecriture_num = f"{inv}-ENC"
+        lib = f"Encaissement facture {inv} ({mode})"
+
+        # Debit payment account
+        fec_rows.append({
+            "JournalCode": journal_code, "JournalLib": journal_lib,
+            "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
+            "CompteNum": debit_acc, "CompteLib": debit_lib,
+            "CompAuxNum": "", "CompAuxLib": "",
+            "PieceRef": inv, "PieceDate": dt.strftime("%Y%m%d"),
+            "EcritureLib": lib,
+            "Debit": amt, "Credit": 0.0,
+            "EcritureLet": "", "DateLet": "",
+            "ValidDate": dt.strftime("%Y%m%d"),
+            "Montantdevise": "", "Idevise": ""
+        })
+
+        # Credit 53
+        fec_rows.append({
+            "JournalCode": journal_code, "JournalLib": journal_lib,
+            "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
+            "CompteNum": compte_53, "CompteLib": lib_53,
+            "CompAuxNum": "", "CompAuxLib": "",
+            "PieceRef": inv, "PieceDate": dt.strftime("%Y%m%d"),
+            "EcritureLib": lib,
+            "Debit": 0.0, "Credit": amt,
+            "EcritureLet": "", "DateLet": "",
+            "ValidDate": dt.strftime("%Y%m%d"),
+            "Montantdevise": "", "Idevise": ""
+        })
+
+    fec = pd.DataFrame(fec_rows, columns=FEC_COLUMNS)
+    for col in ["Debit", "Credit"]:
+        fec[col] = pd.to_numeric(fec[col], errors="coerce").fillna(0.0).round(2)
+    return fec
+
+
+# ============================
+# Build FEC - BANK DEPOSITS (512 D / 5112 C or 531 C)
+# ============================
+def build_fec_remises(remises_df: pd.DataFrame,
+                      journal_code: str,
+                      journal_lib: str,
+                      compte_debit: str,
+                      lib_debit: str,
+                      compte_credit: str,
+                      lib_credit: str,
+                      prefix_num: str,
+                      lib_prefix: str) -> pd.DataFrame:
+    if remises_df.empty:
+        return pd.DataFrame(columns=FEC_COLUMNS)
+
+    fec_rows = []
+    for _, row in remises_df.iterrows():
+        bid = str(row["bordereau_id"])
+        dt = row["remise_date"]
+        amt = round(float(row["total_montant"]), 2)
+
+        ecriture_num = f"{prefix_num}-{bid}"
+        lib = f"{lib_prefix} {bid}"
+
+        # Debit (512)
+        fec_rows.append({
+            "JournalCode": journal_code, "JournalLib": journal_lib,
+            "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
+            "CompteNum": compte_debit, "CompteLib": lib_debit,
+            "CompAuxNum": "", "CompAuxLib": "",
+            "PieceRef": bid, "PieceDate": dt.strftime("%Y%m%d"),
+            "EcritureLib": lib,
+            "Debit": amt, "Credit": 0.0,
+            "EcritureLet": "", "DateLet": "",
+            "ValidDate": dt.strftime("%Y%m%d"),
+            "Montantdevise": "", "Idevise": ""
+        })
+
+        # Credit (5112 or 531)
+        fec_rows.append({
+            "JournalCode": journal_code, "JournalLib": journal_lib,
+            "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
+            "CompteNum": compte_credit, "CompteLib": lib_credit,
+            "CompAuxNum": "", "CompAuxLib": "",
+            "PieceRef": bid, "PieceDate": dt.strftime("%Y%m%d"),
+            "EcritureLib": lib,
+            "Debit": 0.0, "Credit": amt,
+            "EcritureLet": "", "DateLet": "",
+            "ValidDate": dt.strftime("%Y%m%d"),
+            "Montantdevise": "", "Idevise": ""
+        })
+
+    fec = pd.DataFrame(fec_rows, columns=FEC_COLUMNS)
+    for col in ["Debit", "Credit"]:
+        fec[col] = pd.to_numeric(fec[col], errors="coerce").fillna(0.0).round(2)
+    return fec
+
+
+# ============================
+# Streamlit UI
+# ============================
+st.set_page_config(page_title="Optimum → FEC (ventes + encaissements + remises)", layout="wide")
+st.title("Export Optimum/AS3 → FEC (Ventes + Encaissements + Remises chèques/espèces)")
+
+uploaded = st.file_uploader("Importer le fichier .xlsx (3 onglets : caisse + chèques + espèces)", type=["xlsx", "xls"])
+
+with st.sidebar:
+    st.header("Paramètres")
+
+    st.subheader("Compte 53 (caisse à ventiler)")
+    compte_53 = st.text_input("Compte 53", value="530000")
+    lib_53 = st.text_input("Libellé 53", value="Caisse à ventiler")
+
+    st.subheader("Journal VENTES (CA)")
+    jv_code = st.text_input("JournalCode ventes", value="VT")
+    jv_lib = st.text_input("JournalLib ventes", value="Ventes caisse")
+
+    st.subheader("Journal ENCAISSEMENTS")
+    je_code = st.text_input("JournalCode encaissements", value="BQ")
+    je_lib = st.text_input("JournalLib encaissements", value="Règlements")
+
+    st.subheader("Journal REMISES en banque")
+    jr_code = st.text_input("JournalCode remises", value="BQ")
+    jr_lib = st.text_input("JournalLib remises", value="Remises en banque")
+
+    st.subheader("Comptes remises")
+    compte_512 = st.text_input("Compte 512 (Banque) - Débit", value="512000")
+    lib_512 = st.text_input("Lib 512", value="Banque")
+
+    compte_5112 = st.text_input("Compte 5112 (Chèques) - Crédit", value="511200")
+    lib_5112 = st.text_input("Lib 5112", value="Chèques à encaisser")
+
+    compte_531 = st.text_input("Compte 531 (Espèces) - Crédit", value="531000")
+    lib_531 = st.text_input("Lib 531", value="Caisse espèces")
+
+    st.subheader("Options")
+    group_sales = st.checkbox("Regrouper ventes par facture + taux TVA", value=True)
+    group_payments = st.checkbox("Regrouper encaissements par facture + mode", value=True)
+
+    st.subheader("Séparateur export")
+    csv_sep = st.selectbox("Séparateur CSV", options=[";", ",", "\t"], index=0)
+
+    st.subheader("Grille TVA → comptes 70 + TVA")
+    st.caption("Format CSV (;) : TauxTVA;Compte70;Lib70;CompteTVA;LibTVA")
+    vat_default_text = """TauxTVA;Compte70;Lib70;CompteTVA;LibTVA
+0.20;707000;Ventes;445710;TVA collectée 20%
+0.10;707010;Ventes 10%;445712;TVA collectée 10%
+0.055;707005;Ventes 5,5%;445713;TVA collectée 5,5%
+0.00;707000;Ventes exonérées;445700;TVA collectée 0%
+"""
+    vat_text = st.text_area("Grille TVA", value=vat_default_text, height=170)
+
+    st.subheader("Grille modes de règlement → compte Débit")
+    st.caption("Format CSV (;) : Mode;CompteNum;CompteLib")
+    mode_default_text = """Mode;CompteNum;CompteLib
+carte bancaire;511000;CB à encaisser
+chèque;511200;Chèques à encaisser
+espèces;531000;Caisse
+virement;512000;Banque
+tiers-payant;467000;Tiers payant à recevoir
+"""
+    mode_text = st.text_area("Grille modes", value=mode_default_text, height=170)
+
+if not uploaded:
+    st.info("Importe le fichier Excel pour démarrer.")
+    st.stop()
+
+file_bytes = uploaded.read()
+sheets = list_sheets(file_bytes)
+
+def pick_default(patterns):
+    for s in sheets:
+        low = s.lower()
+        if any(p in low for p in patterns):
+            return s
+    return sheets[0]
+
+sheet_caisse = st.sidebar.selectbox(
+    "Onglet CAISSE",
+    sheets,
+    index=sheets.index(pick_default(["caisse", "operation", "opération", "releve", "relevé"]))
 )
+sheet_cheques = st.sidebar.selectbox(
+    "Onglet REMISES CHÈQUES",
+    sheets,
+    index=sheets.index(pick_default(["cheque", "chèque"]))
+)
+sheet_especes = st.sidebar.selectbox(
+    "Onglet REMISES ESPÈCES",
+    sheets,
+    index=sheets.index(pick_default(["espece", "espèce"]))
+)
+
+raw_caisse = read_sheet_raw(file_bytes, sheet_caisse)
+raw_cheques = read_sheet_raw(file_bytes, sheet_cheques)
+raw_especes = read_sheet_raw(file_bytes, sheet_especes)
+
+# ============================
+# Parse mappings
+# ============================
+try:
+    vat_map = build_vat_map_from_csv(vat_text)
+except Exception as e:
+    st.error(f"Erreur lecture grille TVA : {e}")
+    st.stop()
+
+try:
+    mode_acc, mode_lib = build_mode_map_from_csv(mode_text)
+except Exception as e:
+    st.error(f"Erreur lecture grille modes : {e}")
+    st.stop()
+
+# ============================
+# Extract data
+# ============================
+sales_lines = extract_sales_lines(raw_caisse)
+enc = extract_encaissements(raw_caisse)
+rem_cheques = extract_remises_cheques(raw_cheques)
+rem_especes = extract_remises_especes(raw_especes)
+
+# ============================
+# Metrics
+# ============================
+st.subheader("Synthèse")
+c1, c2, c3, c4, c5 = st.columns(5)
+with c1:
+    st.metric("Lignes ventes", int(len(sales_lines)))
+with c2:
+    st.metric("Factures", int(sales_lines["invoice_number"].nunique()) if not sales_lines.empty else 0)
+with c3:
+    st.metric("Lignes encaissements", int(len(enc)))
+with c4:
+    st.metric("Total encaissé", f"{enc['amount'].sum():,.2f} €".replace(",", " ") if not enc.empty else "0,00 €")
+with c5:
+    total_remises = 0.0
+    if not rem_cheques.empty:
+        total_remises += rem_cheques["total_montant"].sum()
+    if not rem_especes.empty:
+        total_remises += rem_especes["total_montant"].sum()
+    st.metric("Total remises", f"{total_remises:,.2f} €".replace(",", " "))
+
+# ============================
+# Warnings mapping
+# ============================
+if not sales_lines.empty:
+    rates = sorted(set([round(float(x), 6) for x in sales_lines["tva_rate"].unique().tolist()]))
+    unmapped_rates = [x for x in rates if x not in vat_map]
+    if unmapped_rates:
+        st.warning("Taux TVA sans mapping (ventes ignorées pour ces taux) : " + ", ".join([str(x) for x in unmapped_rates]))
+
+if not enc.empty:
+    modes = sorted(enc["mode"].unique().tolist())
+    unmapped_modes = [m for m in modes if not mode_acc.get(m)]
+    if unmapped_modes:
+        st.warning("Modes sans mapping (encaissements ignorés pour ces modes) : " + ", ".join(unmapped_modes))
+
+# ============================
+# Build FEC
+# ============================
+fec_sales = build_fec_sales(
+    sales_lines=sales_lines,
+    journal_code=jv_code,
+    journal_lib=jv_lib,
+    compte_53=compte_53,
+    lib_53=lib_53,
+    vat_map=vat_map,
+    group_per_invoice_and_rate=group_sales,
+)
+
+fec_sett = build_fec_settlements(
+    enc_df=enc,
+    journal_code=je_code,
+    journal_lib=je_lib,
+    compte_53=compte_53,
+    lib_53=lib_53,
+    mode_to_debit_account=mode_acc,
+    mode_to_debit_lib=mode_lib,
+    group_same_mode_per_invoice=group_payments,
+)
+
+fec_rem_cheques = build_fec_remises(
+    remises_df=rem_cheques,
+    journal_code=jr_code,
+    journal_lib=jr_lib,
+    compte_debit=compte_512,
+    lib_debit=lib_512,
+    compte_credit=compte_5112,
+    lib_credit=lib_5112,
+    prefix_num="REMCHQ",
+    lib_prefix="Remise chèques bordereau",
+)
+
+fec_rem_especes = build_fec_remises(
+    remises_df=rem_especes,
+    journal_code=jr_code,
+    journal_lib=jr_lib,
+    compte_debit=compte_512,
+    lib_debit=lib_512,
+    compte_credit=compte_531,
+    lib_credit=lib_531,
+    prefix_num="REMESP",
+    lib_prefix="Remise espèces bordereau",
+)
+
+fec_all = pd.concat([fec_sales, fec_sett, fec_rem_cheques, fec_rem_especes], ignore_index=True)
+
+# ============================
+# Display previews
+# ============================
+st.subheader("Aperçu - Ventes (articles)")
+st.dataframe(sales_lines.head(200), use_container_width=True)
+
+st.subheader("Aperçu - Encaissements")
+st.dataframe(enc.head(200), use_container_width=True)
+
+st.subheader("Aperçu - Bordereaux chèques")
+st.dataframe(rem_cheques, use_container_width=True)
+
+st.subheader("Aperçu - Bordereaux espèces")
+st.dataframe(rem_especes, use_container_width=True)
+
+st.subheader("Aperçu FEC - Global")
+st.dataframe(fec_all.head(300), use_container_width=True)
+
+# ============================
+# Balance checks
+# ============================
+st.subheader("Contrôles d'équilibre")
+chk_all = check_balance(fec_all)
+if chk_all.empty:
+    st.info("Aucune écriture générée.")
+else:
+    bad = chk_all[chk_all["Delta"].abs() > 0.01]
+    if bad.empty:
+        st.success("Toutes les écritures sont équilibrées ✅")
+    else:
+        st.error("Certaines écritures ne sont pas équilibrées ❌")
+        st.dataframe(bad, use_container_width=True)
+
+# ============================
+# Downloads
+# ============================
+st.subheader("Téléchargements")
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    st.download_button("CSV FEC - Ventes", data=to_csv_bytes(fec_sales, sep=csv_sep),
+                       file_name="fec_ventes.csv", mime="text/csv")
+with col2:
+    st.download_button("CSV FEC - Encaissements", data=to_csv_bytes(fec_sett, sep=csv_sep),
+                       file_name="fec_encaissements.csv", mime="text/csv")
+with col3:
+    st.download_button("CSV FEC - Remises", data=to_csv_bytes(pd.concat([fec_rem_cheques, fec_rem_especes], ignore_index=True), sep=csv_sep),
+                       file_name="fec_remises.csv", mime="text/csv")
+with col4:
+    st.download_button("CSV FEC - Global", data=to_csv_bytes(fec_all, sep=csv_sep),
+                       file_name="fec_global.csv", mime="text/csv")
